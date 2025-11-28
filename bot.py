@@ -23,7 +23,7 @@ synced = False  # 앱 커맨드 동기화 여부
 MAX_QUEUE = int(os.getenv("MAX_QUEUE", "30"))  # 전체 대기열 제한
 MAX_PER_USER = int(os.getenv("MAX_PER_USER", "10"))  # 사용자별 대기열 제한
 ALLOWED_ROLE = os.getenv("ALLOWED_ROLE")  # 지정 시 해당 역할을 가진 유저만 제어
-VOLUME_DB = float(os.getenv("BOT_VOLUME_DB", "-5"))  # 기본 출력 게인(dB), 음량을 낮추려면 -5~-10 등
+VOLUME_DB = float(os.getenv("BOT_VOLUME_DB", "-9"))  # 기본 출력 게인(dB), 음량을 낮추려면 더 음수로
 STATE_FILE = os.getenv("BOT_STATE_FILE", "bot_state.json")
 CMD_COOLDOWN = float(os.getenv("CMD_COOLDOWN", "2.0"))  # 초 단위, 0이면 해제
 
