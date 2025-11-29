@@ -222,7 +222,7 @@ async def ping(ctx):
     await ctx.send("pong!")
 
 
-@bot.command(name="help")
+@bot.command(name="helpme")
 async def help_cmd(ctx):
     text = (
         "명령어 안내\n"
@@ -231,8 +231,8 @@ async def help_cmd(ctx):
         "- !skip / !stop / !pause / !resume / !queue / !clear / !move / !remove / !panel\n"
         "- 슬래시 버전도 동일: /play, /search, /queue 등\n"
         "- 봇과 같은 음성 채널에 있어야 제어 가능합니다.\n"
-        "- 대기열 제한: 전체 {MAX_QUEUE}곡, 사용자별 {MAX_PER_USER}곡\n"
-        "- 음량은 BOT_VOLUME_DB로 조절(기본 -5dB)"
+        f"- 대기열 제한: 전체 {MAX_QUEUE}곡, 사용자별 {MAX_PER_USER}곡\n"
+        f"- 음량은 BOT_VOLUME_DB로 조절 (현재 기본 {VOLUME_DB}dB)"
     )
     await ctx.send(text)
 
