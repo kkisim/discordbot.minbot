@@ -23,7 +23,7 @@ synced = False  # 앱 커맨드 동기화 여부
 MAX_QUEUE = int(os.getenv("MAX_QUEUE", "30"))  # 전체 대기열 제한
 MAX_PER_USER = int(os.getenv("MAX_PER_USER", "10"))  # 사용자별 대기열 제한
 ALLOWED_ROLE = os.getenv("ALLOWED_ROLE")  # 지정 시 해당 역할을 가진 유저만 제어
-VOLUME_DB = float(os.getenv("BOT_VOLUME_DB", "-9"))  # 기본 출력 게인(dB), 음량을 낮추려면 더 음수로
+VOLUME_DB = float(os.getenv("BOT_VOLUME_DB", "-22"))  # 기본 출력 게인(dB), 음량을 낮추려면 더 음수로
 STATE_FILE = os.getenv("BOT_STATE_FILE", "bot_state.json")
 CMD_COOLDOWN = float(os.getenv("CMD_COOLDOWN", "2.0"))  # 초 단위, 0이면 해제
 
@@ -240,6 +240,11 @@ async def help_cmd(ctx):
 @bot.command(name="미개")
 async def mi_gae(ctx):
     await ctx.send("저는 미개한 김규민입니다")
+
+
+@bot.command(name="매국")
+async def mae_guk(ctx):
+    await ctx.send("저는 매국 김규민 입니다")
 
 
 async def extract_stream(url: str):
@@ -625,7 +630,7 @@ async def leave(ctx):
     await ctx.send("음성 채널 연결을 끊었습니다.")
 
 
-@bot.command()
+@bot.command(aliases=["p"])
 async def play(ctx, *, url: str):
     try:
         cd_err = check_cooldown(ctx.author.id)
