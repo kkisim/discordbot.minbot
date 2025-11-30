@@ -1,11 +1,14 @@
 import os
 import asyncio
 import json
+from datetime import datetime, timedelta
 import time
 import random
 import logging
+from typing import Dict, List, Any
 from collections import deque
 
+import aiohttp
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -26,6 +29,9 @@ ALLOWED_ROLE = os.getenv("ALLOWED_ROLE")  # 지정 시 해당 역할을 가진 �
 VOLUME_DB = float(os.getenv("BOT_VOLUME_DB", "-22"))  # 기본 출력 게인(dB), 음량을 낮추려면 더 음수로
 STATE_FILE = os.getenv("BOT_STATE_FILE", "bot_state.json")
 CMD_COOLDOWN = float(os.getenv("CMD_COOLDOWN", "2.0"))  # 초 단위, 0이면 해제
+DELETE_COMMANDS = os.getenv("DELETE_COMMANDS", "true").lower() in ("1", "true", "yes", "on")
+NEXON_API_KEY = os.getenv("NEXON_API_KEY")
+FIFA_API_KEY = os.getenv("FIFA_API_KEY")
 
 # yt-dlp 설정 (고음질 우선, 검색 허용)
 ytdl_opts = {
@@ -34,6 +40,12 @@ ytdl_opts = {
     "nocheckcertificate": True,
     "noplaylist": True,
     "default_search": "ytsearch",
+    # SABR 피하기 + JS 런타임 경고 완화용
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "default"]
+        }
+    },
 }
 ytdl = yt_dlp.YoutubeDL(ytdl_opts)
 
@@ -46,6 +58,11 @@ repeat_mode: dict[int, str] = {}  # off|one|all
 shuffle_mode: dict[int, bool] = {}
 track_messages: dict[int, discord.Message] = {}
 last_command_at: dict[int, float] = {}
+fc_spid_cache: list[dict] = []
+fc_season_cache: dict[int, str] = {}
+fc_position_cache: dict[int, str] = {}
+fc_spid_map: dict[int, dict] = {}
+fc_meta_loaded = False
 
 # 로깅 설정
 logging.basicConfig(
@@ -148,6 +165,123 @@ async def delete_track_message(guild_id: int):
             pass
 
 
+async def maybe_delete_command(message: discord.Message):
+    if not DELETE_COMMANDS:
+        return
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+async def nexon_get(endpoint: str, params: dict) -> dict:
+    if not NEXON_API_KEY:
+        raise ValueError("NEXON_API_KEY가 설정되지 않았습니다.")
+    headers = {"x-nxopen-api-key": NEXON_API_KEY}
+    url = f"https://open.api.nexon.com{endpoint}"
+    async with aiohttp.ClientSession(headers=headers) as session:
+        async with session.get(url, params=params, timeout=10) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise ValueError(f"API 오류 {resp.status}: {text}")
+            return await resp.json()
+
+
+async def get_ocid(character_name: str) -> str:
+    data = await nexon_get("/maplestory/v1/id", {"character_name": character_name})
+    ocid = data.get("ocid")
+    if not ocid:
+        raise ValueError("캐릭터를 찾지 못했습니다.")
+    return ocid
+
+
+def maple_today():
+    # KST 기준 날짜(단순 +9h)
+    return (datetime.utcnow() + timedelta(hours=9)).date().isoformat()
+
+
+def auction_params(item_name: str):
+    clean = item_name.strip().strip("<>").strip()
+    return {"item_name": clean, "date": maple_today()}, clean
+
+
+async def fc_get(endpoint: str, params: dict) -> dict:
+    if not FIFA_API_KEY:
+        raise ValueError("FIFA_API_KEY가 설정되지 않았습니다.")
+    headers = {"x-nxopen-api-key": FIFA_API_KEY}
+    url = f"https://open.api.nexon.com{endpoint}"
+    async with aiohttp.ClientSession(headers=headers) as session:
+        async with session.get(url, params=params, timeout=10) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise ValueError(f"API 오류 {resp.status}: {text}")
+            return await resp.json()
+
+
+async def fc_get_ouid(nickname: str) -> str:
+    data = await fc_get("/fconline/v1/id", {"nickname": nickname})
+    ouid = data.get("ouid")
+    if not ouid:
+        raise ValueError("계정을 찾지 못했습니다.")
+    return ouid
+
+
+async def ensure_fc_meta():
+    global fc_meta_loaded, fc_spid_cache, fc_season_cache, fc_position_cache
+    if fc_meta_loaded and fc_spid_cache and fc_season_cache and fc_position_cache:
+        return
+    # spid, season 메타
+    spid = await fc_get("/static/fconline/meta/spid.json", {})
+    season = await fc_get("/static/fconline/meta/seasonid.json", {})
+    position = await fc_get("/static/fconline/meta/spposition.json", {})
+    fc_spid_cache = spid if isinstance(spid, list) else []
+    fc_spid_map = {p.get("id"): p for p in fc_spid_cache if p.get("id") is not None}
+    fc_season_cache = {s.get("seasonId"): s.get("className") for s in (season or [])}
+    fc_position_cache = {p.get("spposition"): p.get("desc") for p in (position or [])}
+    fc_meta_loaded = True
+
+
+def find_players_by_name(keyword: str, limit: int = 5) -> list[dict]:
+    kw = keyword.lower()
+    results = []
+    for p in fc_spid_cache:
+        name = p.get("name", "")
+        if kw in name.lower():
+            results.append(p)
+        if len(results) >= limit:
+            break
+    return results
+
+
+def fc_player_image(spid: int) -> str:
+    return f"https://fo4.dn.nexoncdn.co.kr/live/externalAssets/common/playersAction/p{spid}.png"
+
+
+def fc_pretty_player(p: dict) -> str:
+    pname = p.get("name") or "이름없음"
+    spid = p.get("id")
+    # spid 규칙: seasonId * 1,000,000 + pid
+    season_id = p.get("season") or p.get("seasonId")
+    if season_id is None and isinstance(spid, int):
+        season_id = spid // 1_000_000
+    season_name = fc_season_cache.get(season_id, str(season_id) if season_id is not None else "-")
+    pos_code = p.get("spposition")
+    if pos_code is None:
+        pos_code = p.get("position")
+    if pos_code is None:
+        pos_name = "포지션 정보 없음"
+    else:
+        pos_name = fc_position_cache.get(pos_code, str(pos_code))
+    return f"{pname} ({season_name}) | 포지션: {pos_name}"
+
+
+def fc_pretty_player_by_id(spid: int) -> str:
+    info = fc_spid_map.get(spid)
+    if not info:
+        return f"spid {spid}"
+    return fc_pretty_player(info)
+
+
 def save_state():
     data = {
         "queues": {},
@@ -225,26 +359,560 @@ async def ping(ctx):
 @bot.command(name="helpme")
 async def help_cmd(ctx):
     text = (
-        "명령어 안내\n"
-        "- !play <링크|검색어> : 음악 추가/재생 (검색어는 버튼으로 선택)\n"
-        "- !search <키워드> : 유튜브 검색 후 버튼으로 선택\n"
-        "- !skip / !stop / !pause / !resume / !queue / !clear / !move / !remove / !panel\n"
-        "- 슬래시 버전도 동일: /play, /search, /queue 등\n"
-        "- 봇과 같은 음성 채널에 있어야 제어 가능합니다.\n"
-        f"- 대기열 제한: 전체 {MAX_QUEUE}곡, 사용자별 {MAX_PER_USER}곡\n"
-        f"- 음량은 BOT_VOLUME_DB로 조절 (현재 기본 {VOLUME_DB}dB)"
+        "▶ 음악\n"
+        f"- !p / !play <링크|검색어> (슬래시 /play도 가능). 대기열 {MAX_QUEUE}곡, 1인 {MAX_PER_USER}곡.\n"
+        "- !search → 버튼 선택, !queue / !clear / !move / !remove / !skip / !stop / !pause / !resume / !panel\n"
+        "- 같은 음성 채널에서만 제어. 안내 숨김은 QUIET_NOTICE, 명령 삭제는 DELETE_COMMANDS, 음량은 BOT_VOLUME_DB(기본 {VOLUME_DB}dB)\n"
+        "\n▶ 메이플 (NEXON_API_KEY 필요, 슬래시도 동일 이름)\n"
+        "- 기본: !ms / !msbasic(메이플기본), !msstat(능력치), !mspop(인기도)\n"
+        "- 장비/스킬: !msequip(장비), !msskill(스킬), !mslink(링크스킬), !mspet(펫), !msandroid(안드로이드), !msbeauty(헤어성형)\n"
+        "- 매트릭스: !msvmatrix(브이매트릭스), !mshexa(헥사), !mshexastat(헥사스탯)\n"
+        "- 기타: !msdojo(무릉), !msotherstat(기타스탯), !msauc(경매) <아이템명>\n"
+        "\n▶ FC온라인 (FIFA_API_KEY 필요, 슬래시도 동일 이름)\n"
+        "- !fc / !fcbasic(피파기본) <닉네임>\n"
+        "- !fcmax(피파등급), !fcmatch(피파경기) [matchtype 기본 50], !fctrade(피파거래)\n"
+        "- !fcmatchdetail(피파전적): 최근 5경기 스코어/상대\n"
+        "- !fcmeta(피파메타) [matchtype|season|division]\n"
+        "- !fcplayer(선수검색) <이름>: 선수 목록(시즌/포지션/이미지)\n"
+        "\n▶ 설정/실행\n"
+        "- 필수: DISCORD_TOKEN, (선택) NEXON_API_KEY, FIFA_API_KEY\n"
+        "- 자주 쓰는 옵션: BOT_VOLUME_DB, DELETE_COMMANDS, QUIET_NOTICE, MAX_QUEUE, MAX_PER_USER\n"
+        "- 상태 저장: bot_state.json(STATE_FILE), 컨테이너/서버에서는 볼륨 마운트 권장\n"
+        "\n기타: !미개, !매국"
     )
     await ctx.send(text)
 
 
 @bot.command(name="미개")
 async def mi_gae(ctx):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
     await ctx.send("저는 미개한 김규민입니다")
 
 
 @bot.command(name="매국")
 async def mae_guk(ctx):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
     await ctx.send("저는 매국 김규민 입니다")
+
+
+@bot.command(name="msbasic", aliases=["ms", "메이플기본"])
+async def ms_basic(ctx, *, character_name: str):
+    """메이플 캐릭터 기본 정보 조회."""
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    if not NEXON_API_KEY:
+        return await ctx.send("NEXON_API_KEY가 설정되지 않았습니다.")
+
+    try:
+        # 1) ocid 조회
+        ocid_data = await nexon_get("/maplestory/v1/id", {"character_name": character_name})
+        ocid = ocid_data.get("ocid")
+        if not ocid:
+            return await ctx.send("캐릭터를 찾지 못했습니다.")
+
+        # 2) 기본 정보 조회
+        basic = await nexon_get("/maplestory/v1/character/basic", {"ocid": ocid})
+        name = basic.get("character_name", character_name)
+        world = basic.get("world_name", "?")
+        level = basic.get("character_level", "?")
+        job = basic.get("character_class", "?")
+        gender = basic.get("character_gender", "?")
+        guild = basic.get("character_guild_name") or "-"
+        create = basic.get("character_date_create") or "-"
+
+        desc = (
+            f"월드: {world}\n"
+            f"레벨: {level}\n"
+            f"직업: {job}\n"
+            f"성별: {gender}\n"
+            f"길드: {guild}\n"
+            f"생성일: {create}"
+        )
+        embed = discord.Embed(title=f"{name} 기본 정보", description=desc, color=0x57F287)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="msstat", aliases=["능력치"])
+async def ms_stat(ctx, *, character_name: str):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        ocid = await get_ocid(character_name)
+        stat = await nexon_get("/maplestory/v1/character/stat", {"ocid": ocid})
+        latest = (stat.get("stat") or [])[:8]
+        lines = [f"{s.get('stat_name')}: {s.get('stat_value')}" for s in latest]
+        embed = discord.Embed(title=f"{character_name} 종합 능력치", description="\n".join(lines) or "데이터 없음", color=0x57F287)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="mspop", aliases=["인기도"])
+async def ms_pop(ctx, *, character_name: str):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        ocid = await get_ocid(character_name)
+        pop = await nexon_get("/maplestory/v1/character/popularity", {"ocid": ocid})
+        value = pop.get("popularity") or "?"
+        embed = discord.Embed(title=f"{character_name} 인기도", description=f"인기도: {value}", color=0x57F287)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="msequip", aliases=["장비"])
+async def ms_equip(ctx, *, character_name: str):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        ocid = await get_ocid(character_name)
+        eq = await nexon_get("/maplestory/v1/character/item-equipment", {"ocid": ocid})
+        items = (eq.get("item_equipment") or [])[:10]
+        lines = []
+        for it in items:
+            name = it.get("item_name") or "이름없음"
+            star = it.get("starforce") or 0
+            main = it.get("item_option", [])
+            first_opt = main[0]["option_value"] if main else ""
+            lines.append(f"{name} ★{star} {first_opt}")
+        embed = discord.Embed(title=f"{character_name} 장착 장비 (상위 10)", description="\n".join(lines) or "데이터 없음", color=0x57F287)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="msskill", aliases=["스킬"])
+async def ms_skill(ctx, *, character_name: str):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        ocid = await get_ocid(character_name)
+        skills = await nexon_get("/maplestory/v1/character/skill", {"ocid": ocid})
+        list_skill = (skills.get("character_skill") or [])[:10]
+        lines = [f"{s.get('skill_name')} Lv.{s.get('skill_level')}" for s in list_skill]
+        embed = discord.Embed(title=f"{character_name} 스킬 (상위 10)", description="\n".join(lines) or "데이터 없음", color=0x57F287)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="msauc", aliases=["경매"])
+async def ms_auction(ctx, *, item_name: str):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        params, clean = auction_params(item_name)
+        data = await nexon_get("/maplestory/v1/auction", params)
+        rows = sorted(data.get("items") or [], key=lambda x: x.get("unit_price", 0))[:5]
+        lines = [f"{r.get('item_name')} | {r.get('unit_price')}메소 x{r.get('count',1)}" for r in rows]
+        embed = discord.Embed(title=f"경매장 시세: {clean}", description="\n".join(lines) or "데이터 없음", color=0xFEE75C)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        msg = str(exc)
+        if "OPENAPI00004" in msg or "valid parameter" in msg:
+            await ctx.send("조회 실패: 아이템명을 정확히 입력해 주세요. 예) !경매 몽환의 벨트")
+        else:
+            await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="msbeauty", aliases=["헤어성형"])
+async def ms_beauty(ctx, *, character_name: str):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        ocid = await get_ocid(character_name)
+        data = await nexon_get("/maplestory/v1/character/beauty-equipment", {"ocid": ocid})
+        hair = data.get("character_hair") or "-"
+        face = data.get("character_face") or "-"
+        skin = data.get("character_skin_name") or "-"
+        embed = discord.Embed(title=f"{character_name} 헤어/성형/피부", color=0x57F287)
+        embed.add_field(name="헤어", value=hair, inline=False)
+        embed.add_field(name="성형", value=face, inline=False)
+        embed.add_field(name="피부", value=skin, inline=False)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="msandroid", aliases=["안드로이드"])
+async def ms_android(ctx, *, character_name: str):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        ocid = await get_ocid(character_name)
+        data = await nexon_get("/maplestory/v1/character/android-equipment", {"ocid": ocid})
+        android = data.get("android_name") or "-"
+        hair = data.get("android_hair") or "-"
+        face = data.get("android_face") or "-"
+        embed = discord.Embed(title=f"{character_name} 안드로이드", color=0x57F287)
+        embed.add_field(name="이름", value=android, inline=False)
+        embed.add_field(name="헤어", value=hair, inline=True)
+        embed.add_field(name="성형", value=face, inline=True)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="mspet", aliases=["펫"])
+async def ms_pet(ctx, *, character_name: str):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        ocid = await get_ocid(character_name)
+        data = await nexon_get("/maplestory/v1/character/pet-equipment", {"ocid": ocid})
+        pets = data.get("pet_equipment") or []
+        lines = []
+        for p in pets[:3]:
+            lines.append(f"{p.get('pet_name')} | 장비: {p.get('pet_equipment_item_name') or '-'}")
+        embed = discord.Embed(title=f"{character_name} 펫 정보", description="\n".join(lines) or "펫 없음", color=0x57F287)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="mslink", aliases=["링크스킬"])
+async def ms_link(ctx, *, character_name: str):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        ocid = await get_ocid(character_name)
+        data = await nexon_get("/maplestory/v1/character/link-skill", {"ocid": ocid})
+        skills = (data.get("character_link_skill") or [])[:5]
+        lines = [f"{s.get('skill_name')} Lv.{s.get('skill_level')}" for s in skills]
+        embed = discord.Embed(title=f"{character_name} 링크 스킬", description="\n".join(lines) or "데이터 없음", color=0x57F287)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="msvmatrix", aliases=["브이매트릭스"])
+async def ms_vmatrix(ctx, *, character_name: str):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        ocid = await get_ocid(character_name)
+        data = await nexon_get("/maplestory/v1/character/vmatrix", {"ocid": ocid})
+        cores = (data.get("character_v_core_equipment") or [])[:6]
+        lines = [f"{c.get('v_core_name')} Lv.{c.get('v_core_level')}" for c in cores]
+        embed = discord.Embed(title=f"{character_name} V매트릭스", description="\n".join(lines) or "데이터 없음", color=0x57F287)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="mshexa", aliases=["헥사"])
+async def ms_hexa(ctx, *, character_name: str):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        ocid = await get_ocid(character_name)
+        data = await nexon_get("/maplestory/v1/character/hexamatrix", {"ocid": ocid})
+        skills = (data.get("character_hexacore_equipment") or [])[:6]
+        lines = [f"{h.get('hexa_core_name')} Lv.{h.get('hexa_core_level')}" for h in skills]
+        embed = discord.Embed(title=f"{character_name} HEXA 코어", description="\n".join(lines) or "데이터 없음", color=0x57F287)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="mshexastat", aliases=["헥사스탯"])
+async def ms_hexastat(ctx, *, character_name: str):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        ocid = await get_ocid(character_name)
+        data = await nexon_get("/maplestory/v1/character/hexamatrix-stat", {"ocid": ocid})
+        stats = data.get("character_hexamatrix_stat_core") or []
+        lines = []
+        for s in stats[:5]:
+            lines.append(f"{s.get('stat_core_name')} Lv.{s.get('stat_core_level')}")
+        embed = discord.Embed(title=f"{character_name} HEXA 스탯", description="\n".join(lines) or "데이터 없음", color=0x57F287)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="msdojo", aliases=["무릉"])
+async def ms_dojo(ctx, *, character_name: str):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        ocid = await get_ocid(character_name)
+        data = await nexon_get("/maplestory/v1/character/dojang", {"ocid": ocid})
+        floor = data.get("dojang_best_floor") or "?"
+        rank = data.get("dojang_best_time_rank") or "?"
+        time_val = data.get("dojang_best_time") or "?"
+        embed = discord.Embed(title=f"{character_name} 무릉도장", color=0x57F287)
+        embed.add_field(name="최고 층", value=floor, inline=True)
+        embed.add_field(name="랭크", value=rank, inline=True)
+        embed.add_field(name="기록", value=f"{time_val}초", inline=True)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="msotherstat", aliases=["기타스탯"])
+async def ms_otherstat(ctx, *, character_name: str):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        ocid = await get_ocid(character_name)
+        data = await nexon_get("/maplestory/v1/character/other-stat", {"ocid": ocid})
+        stats = data.get("character_additional_information") or []
+        lines = [f"{s.get('stat_name')}: {s.get('stat_value')}" for s in stats[:8]]
+        embed = discord.Embed(title=f"{character_name} 기타 능력치", description="\n".join(lines) or "데이터 없음", color=0x57F287)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+# FC Online
+@bot.command(name="fcbasic", aliases=["fc", "피파기본"])
+async def fc_basic(ctx, *, nickname: str):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        ouid = await fc_get_ouid(nickname)
+        data = await fc_get("/fconline/v1/user/basic", {"ouid": ouid})
+        level = data.get("level", "?")
+        nickname = data.get("nickname", nickname)
+        access = data.get("access_id", "-")
+        desc = f"레벨: {level}\n닉네임: {nickname}\nAccess ID: {access}"
+        embed = discord.Embed(title=f"{nickname} 기본 정보", description=desc, color=0x3498DB)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="fcmax", aliases=["피파등급"])
+async def fc_max(ctx, *, nickname: str):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        ouid = await fc_get_ouid(nickname)
+        data = await fc_get("/fconline/v1/user/maxdivision", {"ouid": ouid})
+        latest = data.get("maxdivision") or []
+        lines = []
+        for d in latest[:5]:
+            lines.append(f"시즌:{d.get('seasonId')} | 등급:{d.get('division')} | 타입:{d.get('matchType')}")
+        embed = discord.Embed(title=f"{nickname} 역대 최고 등급", description="\n".join(lines) or "데이터 없음", color=0x3498DB)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="fcmatch", aliases=["피파경기", "최근경기"])
+async def fc_match(ctx, nickname: str, matchtype: str = "50"):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        ouid = await fc_get_ouid(nickname)
+        params = {"ouid": ouid, "offset": 0, "limit": 5, "matchtype": matchtype}
+        matches = await fc_get("/fconline/v1/user/match", params)
+        ids = matches if isinstance(matches, list) else []
+        lines = []
+        for mid in ids[:5]:
+            try:
+                detail = await fc_get("/fconline/v1/match-detail", {"matchid": mid})
+                infos = detail.get("matchInfo") or []
+                if len(infos) < 2:
+                    lines.append(f"{mid}: 상세 없음")
+                    continue
+                p1, p2 = infos[0], infos[1]
+                mine = p1 if p1.get("ouid") == ouid else p2
+                opp = p2 if mine is p1 else p1
+                my_score = mine.get("shoot", {}).get("goalTotal") if mine else "?"
+                opp_score = opp.get("shoot", {}).get("goalTotal") if opp else "?"
+                opp_name = opp.get("nickname") if opp else "?"
+                result = "무" if my_score == opp_score else ("승" if my_score > opp_score else "패")
+                lines.append(f"{result} {my_score}:{opp_score} vs {opp_name}")
+            except Exception as inner:
+                lines.append(f"{mid}: 상세 실패 ({inner})")
+        embed = discord.Embed(title=f"{nickname} 최근 경기 (최대 5)", description="\n".join(lines) or "데이터 없음", color=0x3498DB)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="fctrade", aliases=["피파거래"])
+async def fc_trade(ctx, nickname: str, tradetype: str = "sell"):
+    """tradetype: sell(판매) / buy(구매). 기본 sell."""
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        nickname = nickname.strip()
+        tmap = {"sell": "sell", "buy": "buy", "판매": "sell", "구매": "buy"}
+        tval = tmap.get(tradetype.lower())
+        if not tval:
+            return await ctx.send("tradetype은 sell(판매)/buy(구매) 중 하나를 입력하세요.")
+        ouid = await fc_get_ouid(nickname)
+        params = {"ouid": ouid, "tradetype": tval, "offset": 0, "limit": 5}
+        try:
+            data = await fc_get("/fconline/v1/user/trade", params)
+        except ValueError as exc:
+            if "OPENAPI00004" in str(exc):
+                # tradetype 없이 재시도
+                data = await fc_get("/fconline/v1/user/trade", {"ouid": ouid, "offset": 0, "limit": 5})
+            else:
+                raise
+        rows = data.get("trades") if isinstance(data, dict) else data
+        rows = rows or []
+        lines = []
+        for r in rows[:5]:
+            item = r.get("spid") or "-"
+            price = r.get("value") or "-"
+            trade_type = r.get("tradeType") or tval
+            lines.append(f"{trade_type} | 아이템:{item} | 가격:{price}")
+        embed = discord.Embed(
+            title=f"{nickname} 거래 기록(최근 5, {tval})",
+            description="\n".join(lines) or "데이터 없음",
+            color=0x3498DB,
+        )
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        msg = str(exc)
+        if "OPENAPI00004" in msg:
+            await ctx.send("조회 실패: 닉네임을 확인하거나 거래 내역이 없는 경우일 수 있습니다. tradetype은 sell/buy만 지원하며, 없으면 자동 재시도합니다.")
+        else:
+            await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="fcmatchdetail", aliases=["피파전적"])
+async def fc_matchdetail(ctx, nickname: str, matchtype: str = "50"):
+    """최근 5경기 상대 닉네임과 스코어 요약"""
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        ouid = await fc_get_ouid(nickname)
+        params = {"ouid": ouid, "offset": 0, "limit": 5, "matchtype": matchtype}
+        match_ids = await fc_get("/fconline/v1/user/match", params)
+        match_ids = match_ids if isinstance(match_ids, list) else []
+        lines = []
+        for mid in match_ids[:5]:
+            try:
+                detail = await fc_get("/fconline/v1/match-detail", {"matchid": mid})
+                infos = detail.get("matchInfo") or []
+                if len(infos) < 2:
+                    lines.append(f"{mid}: 상세 없음")
+                    continue
+                p1, p2 = infos[0], infos[1]
+                # 내 팀 판단
+                mine = p1 if p1.get("ouid") == ouid else p2
+                opp = p2 if mine is p1 else p1
+                my_score = mine.get("shoot", {}).get("goalTotal") if mine else "?"
+                opp_score = opp.get("shoot", {}).get("goalTotal") if opp else "?"
+                opp_name = opp.get("nickname") if opp else "?"
+                result = "무" if my_score == opp_score else ("승" if my_score > opp_score else "패")
+                lines.append(f"{result} {my_score}:{opp_score} vs {opp_name}")
+            except Exception as inner:
+                lines.append(f"{mid}: 상세 실패 ({inner})")
+        embed = discord.Embed(
+            title=f"{nickname} 최근 경기 요약",
+            description="\n".join(lines) or "데이터 없음",
+            color=0x3498DB,
+        )
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="fcplayer", aliases=["선수검색"])
+async def fc_player(ctx, *, name: str):
+    """선수 이름으로 검색 후 시즌/포지션/이미지 표시(최대 5개)"""
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    try:
+        await ensure_fc_meta()
+        matches = find_players_by_name(name, limit=5)
+        if not matches:
+            return await ctx.send("검색 결과가 없습니다.")
+        lines = [fc_pretty_player(p) for p in matches]
+        embed = discord.Embed(title=f"선수 검색: {name}", description="\n".join(lines), color=0x3498DB)
+        first_spid = matches[0].get("id")
+        if first_spid:
+            embed.set_thumbnail(url=fc_player_image(first_spid))
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="fcmeta", aliases=["피파메타"])
+async def fc_meta(ctx, meta_type: str = "matchtype"):
+    """FC Online 메타데이터(매치타입/시즌/등급) 요약."""
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    meta_type = meta_type.lower()
+    endpoint_map = {
+        "matchtype": "/static/fconline/meta/matchtype.json",
+        "season": "/static/fconline/meta/seasonid.json",
+        "division": "/static/fconline/meta/division.json",
+    }
+    endpoint = endpoint_map.get(meta_type)
+    if not endpoint:
+        return await ctx.send("사용법: !fcmeta [matchtype|season|division]")
+    try:
+        data = await fc_get(endpoint, {})
+        if isinstance(data, list):
+            items = data[:10]
+            if meta_type == "matchtype":
+                lines = [f"{d.get('matchtype')}: {d.get('desc')}" for d in items]
+            elif meta_type == "season":
+                lines = [f"{d.get('seasonId')}: {d.get('className')}" for d in items]
+            else:
+                lines = [f"{d.get('divisionId')}: {d.get('divisionName')}" for d in items]
+        else:
+            lines = ["데이터 없음"]
+        embed = discord.Embed(title=f"FC 메타 ({meta_type})", description="\n".join(lines) or "데이터 없음", color=0x3498DB)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
 
 
 async def extract_stream(url: str):
@@ -557,7 +1225,7 @@ async def start_playback(guild: discord.Guild, voice: discord.VoiceClient):
     voice.play(source, after=after_playback)
     # 이전 재생 알림 삭제 후 새 알림(가능하면 기존 메시지를 재활용)
     await delete_track_message(guild.id)
-    if channel:
+    if not QUIET_NOTICE and channel:
         try:
             msg = await channel.send(f"재생 시작: {title}")
             track_messages[guild.id] = msg
@@ -1190,6 +1858,465 @@ async def slash_choose(interaction: discord.Interaction, index: int):
         await start_playback(interaction.guild, voice)
     await update_panel(interaction.guild, channel=interaction.channel)
     save_state()
+
+
+# ---------- MapleStory Slash ----------
+
+
+@tree.command(name="msbasic", description="메이플 기본 정보 조회")
+@app_commands.describe(character_name="캐릭터 이름")
+async def slash_msbasic(interaction: discord.Interaction, character_name: str):
+    if not NEXON_API_KEY:
+        return await interaction.response.send_message("NEXON_API_KEY가 설정되지 않았습니다.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ocid = await get_ocid(character_name)
+        basic = await nexon_get("/maplestory/v1/character/basic", {"ocid": ocid})
+        name = basic.get("character_name", character_name)
+        world = basic.get("world_name", "?")
+        level = basic.get("character_level", "?")
+        job = basic.get("character_class", "?")
+        gender = basic.get("character_gender", "?")
+        guild = basic.get("character_guild_name") or "-"
+        create = basic.get("character_date_create") or "-"
+        desc = f"월드: {world}\n레벨: {level}\n직업: {job}\n성별: {gender}\n길드: {guild}\n생성일: {create}"
+        embed = discord.Embed(title=f"{name} 기본 정보", description=desc, color=0x57F287)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="msstat", description="메이플 종합 능력치 조회")
+@app_commands.describe(character_name="캐릭터 이름")
+async def slash_msstat(interaction: discord.Interaction, character_name: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ocid = await get_ocid(character_name)
+        stat = await nexon_get("/maplestory/v1/character/stat", {"ocid": ocid})
+        latest = (stat.get("stat") or [])[:8]
+        lines = [f"{s.get('stat_name')}: {s.get('stat_value')}" for s in latest]
+        embed = discord.Embed(title=f"{character_name} 종합 능력치", description="\n".join(lines) or "데이터 없음", color=0x57F287)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="mspop", description="메이플 인기도 조회")
+@app_commands.describe(character_name="캐릭터 이름")
+async def slash_mspop(interaction: discord.Interaction, character_name: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ocid = await get_ocid(character_name)
+        pop = await nexon_get("/maplestory/v1/character/popularity", {"ocid": ocid})
+        value = pop.get("popularity") or "?"
+        embed = discord.Embed(title=f"{character_name} 인기도", description=f"인기도: {value}", color=0x57F287)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="msequip", description="메이플 장착 장비 조회")
+@app_commands.describe(character_name="캐릭터 이름")
+async def slash_msequip(interaction: discord.Interaction, character_name: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ocid = await get_ocid(character_name)
+        eq = await nexon_get("/maplestory/v1/character/item-equipment", {"ocid": ocid})
+        items = (eq.get("item_equipment") or [])[:10]
+        lines = []
+        for it in items:
+            name = it.get("item_name") or "이름없음"
+            star = it.get("starforce") or 0
+            main = it.get("item_option", [])
+            first_opt = main[0]["option_value"] if main else ""
+            lines.append(f"{name} ★{star} {first_opt}")
+        embed = discord.Embed(title=f"{character_name} 장착 장비 (상위 10)", description="\n".join(lines) or "데이터 없음", color=0x57F287)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="msskill", description="메이플 스킬 조회")
+@app_commands.describe(character_name="캐릭터 이름")
+async def slash_msskill(interaction: discord.Interaction, character_name: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ocid = await get_ocid(character_name)
+        skills = await nexon_get("/maplestory/v1/character/skill", {"ocid": ocid})
+        list_skill = (skills.get("character_skill") or [])[:10]
+        lines = [f"{s.get('skill_name')} Lv.{s.get('skill_level')}" for s in list_skill]
+        embed = discord.Embed(title=f"{character_name} 스킬 (상위 10)", description="\n".join(lines) or "데이터 없음", color=0x57F287)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="mslink", description="메이플 링크 스킬 조회")
+@app_commands.describe(character_name="캐릭터 이름")
+async def slash_mslink(interaction: discord.Interaction, character_name: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ocid = await get_ocid(character_name)
+        data = await nexon_get("/maplestory/v1/character/link-skill", {"ocid": ocid})
+        skills = (data.get("character_link_skill") or [])[:5]
+        lines = [f"{s.get('skill_name')} Lv.{s.get('skill_level')}" for s in skills]
+        embed = discord.Embed(title=f"{character_name} 링크 스킬", description="\n".join(lines) or "데이터 없음", color=0x57F287)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="mspet", description="메이플 펫 정보 조회")
+@app_commands.describe(character_name="캐릭터 이름")
+async def slash_mspet(interaction: discord.Interaction, character_name: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ocid = await get_ocid(character_name)
+        data = await nexon_get("/maplestory/v1/character/pet-equipment", {"ocid": ocid})
+        pets = data.get("pet_equipment") or []
+        lines = []
+        for p in pets[:3]:
+            lines.append(f"{p.get('pet_name')} | 장비: {p.get('pet_equipment_item_name') or '-'}")
+        embed = discord.Embed(title=f"{character_name} 펫 정보", description="\n".join(lines) or "펫 없음", color=0x57F287)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="msandroid", description="메이플 안드로이드 정보 조회")
+@app_commands.describe(character_name="캐릭터 이름")
+async def slash_msandroid(interaction: discord.Interaction, character_name: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ocid = await get_ocid(character_name)
+        data = await nexon_get("/maplestory/v1/character/android-equipment", {"ocid": ocid})
+        android = data.get("android_name") or "-"
+        hair = data.get("android_hair") or "-"
+        face = data.get("android_face") or "-"
+        embed = discord.Embed(title=f"{character_name} 안드로이드", color=0x57F287)
+        embed.add_field(name="이름", value=android, inline=False)
+        embed.add_field(name="헤어", value=hair, inline=True)
+        embed.add_field(name="성형", value=face, inline=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="msbeauty", description="메이플 헤어/성형/피부 조회")
+@app_commands.describe(character_name="캐릭터 이름")
+async def slash_msbeauty(interaction: discord.Interaction, character_name: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ocid = await get_ocid(character_name)
+        data = await nexon_get("/maplestory/v1/character/beauty-equipment", {"ocid": ocid})
+        hair = data.get("character_hair") or "-"
+        face = data.get("character_face") or "-"
+        skin = data.get("character_skin_name") or "-"
+        embed = discord.Embed(title=f"{character_name} 헤어/성형/피부", color=0x57F287)
+        embed.add_field(name="헤어", value=hair, inline=False)
+        embed.add_field(name="성형", value=face, inline=False)
+        embed.add_field(name="피부", value=skin, inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="msvmatrix", description="메이플 V매트릭스 조회")
+@app_commands.describe(character_name="캐릭터 이름")
+async def slash_msvmatrix(interaction: discord.Interaction, character_name: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ocid = await get_ocid(character_name)
+        data = await nexon_get("/maplestory/v1/character/vmatrix", {"ocid": ocid})
+        cores = (data.get("character_v_core_equipment") or [])[:6]
+        lines = [f"{c.get('v_core_name')} Lv.{c.get('v_core_level')}" for c in cores]
+        embed = discord.Embed(title=f"{character_name} V매트릭스", description="\n".join(lines) or "데이터 없음", color=0x57F287)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="mshexa", description="메이플 HEXA 코어 조회")
+@app_commands.describe(character_name="캐릭터 이름")
+async def slash_mshexa(interaction: discord.Interaction, character_name: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ocid = await get_ocid(character_name)
+        data = await nexon_get("/maplestory/v1/character/hexamatrix", {"ocid": ocid})
+        skills = (data.get("character_hexacore_equipment") or [])[:6]
+        lines = [f"{h.get('hexa_core_name')} Lv.{h.get('hexa_core_level')}" for h in skills]
+        embed = discord.Embed(title=f"{character_name} HEXA 코어", description="\n".join(lines) or "데이터 없음", color=0x57F287)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="mshexastat", description="메이플 HEXA 스탯 조회")
+@app_commands.describe(character_name="캐릭터 이름")
+async def slash_mshexastat(interaction: discord.Interaction, character_name: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ocid = await get_ocid(character_name)
+        data = await nexon_get("/maplestory/v1/character/hexamatrix-stat", {"ocid": ocid})
+        stats = data.get("character_hexamatrix_stat_core") or []
+        lines = [f"{s.get('stat_core_name')} Lv.{s.get('stat_core_level')}" for s in stats[:5]]
+        embed = discord.Embed(title=f"{character_name} HEXA 스탯", description="\n".join(lines) or "데이터 없음", color=0x57F287)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="msdojo", description="메이플 무릉도장 기록 조회")
+@app_commands.describe(character_name="캐릭터 이름")
+async def slash_msdojo(interaction: discord.Interaction, character_name: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ocid = await get_ocid(character_name)
+        data = await nexon_get("/maplestory/v1/character/dojang", {"ocid": ocid})
+        floor = data.get("dojang_best_floor") or "?"
+        rank = data.get("dojang_best_time_rank") or "?"
+        time_val = data.get("dojang_best_time") or "?"
+        embed = discord.Embed(title=f"{character_name} 무릉도장", color=0x57F287)
+        embed.add_field(name="최고 층", value=floor, inline=True)
+        embed.add_field(name="랭크", value=rank, inline=True)
+        embed.add_field(name="기록", value=f"{time_val}초", inline=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="msotherstat", description="메이플 기타 능력치 조회")
+@app_commands.describe(character_name="캐릭터 이름")
+async def slash_msotherstat(interaction: discord.Interaction, character_name: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ocid = await get_ocid(character_name)
+        data = await nexon_get("/maplestory/v1/character/other-stat", {"ocid": ocid})
+        stats = data.get("character_additional_information") or []
+        lines = [f"{s.get('stat_name')}: {s.get('stat_value')}" for s in stats[:8]]
+        embed = discord.Embed(title=f"{character_name} 기타 능력치", description="\n".join(lines) or "데이터 없음", color=0x57F287)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="msauc", description="메이플 경매장 시세 조회")
+@app_commands.describe(item_name="아이템 이름")
+async def slash_msauc(interaction: discord.Interaction, item_name: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        params, clean = auction_params(item_name)
+        data = await nexon_get("/maplestory/v1/auction", params)
+        rows = sorted(data.get("items") or [], key=lambda x: x.get("unit_price", 0))[:5]
+        lines = [f"{r.get('item_name')} | {r.get('unit_price')}메소 x{r.get('count',1)}" for r in rows]
+        embed = discord.Embed(title=f"경매장 시세: {clean}", description="\n".join(lines) or "데이터 없음", color=0xFEE75C)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        msg = str(exc)
+        if "OPENAPI00004" in msg or "valid parameter" in msg:
+            await interaction.followup.send("조회 실패: 아이템명을 정확히 입력해 주세요. 예) /msauc 몽환의 벨트", ephemeral=True)
+        else:
+            await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+# ---------- FC Online Slash ----------
+
+
+@tree.command(name="fcbasic", description="FC 온라인 기본 정보")
+@app_commands.describe(nickname="닉네임")
+async def slash_fcbasic(interaction: discord.Interaction, nickname: str):
+    if not FIFA_API_KEY:
+        return await interaction.response.send_message("FIFA_API_KEY가 설정되지 않았습니다.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ouid = await fc_get_ouid(nickname)
+        data = await fc_get("/fconline/v1/user/basic", {"ouid": ouid})
+        level = data.get("level", "?")
+        nickname = data.get("nickname", nickname)
+        access = data.get("access_id", "-")
+        desc = f"레벨: {level}\n닉네임: {nickname}\nAccess ID: {access}"
+        embed = discord.Embed(title=f"{nickname} 기본 정보", description=desc, color=0x3498DB)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="fcmax", description="FC 역대 최고 등급")
+@app_commands.describe(nickname="닉네임")
+async def slash_fcmax(interaction: discord.Interaction, nickname: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ouid = await fc_get_ouid(nickname)
+        data = await fc_get("/fconline/v1/user/maxdivision", {"ouid": ouid})
+        latest = data.get("maxdivision") or []
+        lines = [f"시즌:{d.get('seasonId')} | 등급:{d.get('division')} | 타입:{d.get('matchType')}" for d in latest[:5]]
+        embed = discord.Embed(title=f"{nickname} 역대 최고 등급", description="\n".join(lines) or "데이터 없음", color=0x3498DB)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="fcmatch", description="FC 최근 경기 ID 조회")
+@app_commands.describe(nickname="닉네임", matchtype="매치타입 (기본 50)")
+async def slash_fcmatch(interaction: discord.Interaction, nickname: str, matchtype: str = "50"):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ouid = await fc_get_ouid(nickname)
+        params = {"ouid": ouid, "offset": 0, "limit": 5, "matchtype": matchtype}
+        matches = await fc_get("/fconline/v1/user/match", params)
+        ids = matches if isinstance(matches, list) else []
+        lines = []
+        for mid in ids[:5]:
+            try:
+                detail = await fc_get("/fconline/v1/match-detail", {"matchid": mid})
+                infos = detail.get("matchInfo") or []
+                if len(infos) < 2:
+                    lines.append(f"{mid}: 상세 없음")
+                    continue
+                p1, p2 = infos[0], infos[1]
+                mine = p1 if p1.get("ouid") == ouid else p2
+                opp = p2 if mine is p1 else p1
+                my_score = mine.get("shoot", {}).get("goalTotal") if mine else "?"
+                opp_score = opp.get("shoot", {}).get("goalTotal") if opp else "?"
+                opp_name = opp.get("nickname") if opp else "?"
+                result = "무" if my_score == opp_score else ("승" if my_score > opp_score else "패")
+                lines.append(f"{result} {my_score}:{opp_score} vs {opp_name} (matchId {mid})")
+            except Exception as inner:
+                lines.append(f"{mid}: 상세 실패 ({inner})")
+        embed = discord.Embed(title=f"{nickname} 최근 경기 (최대 5)", description="\n".join(lines) or "데이터 없음", color=0x3498DB)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="fctrade", description="FC 최근 거래 조회")
+@app_commands.describe(nickname="닉네임", tradetype="sell(판매)/buy(구매), 기본 sell")
+async def slash_fctrade(interaction: discord.Interaction, nickname: str, tradetype: str = "sell"):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        nickname = nickname.strip()
+        tmap = {"sell": "sell", "buy": "buy", "판매": "sell", "구매": "buy"}
+        tval = tmap.get(tradetype.lower())
+        if not tval:
+            return await interaction.followup.send("tradetype은 sell(판매)/buy(구매) 중 하나", ephemeral=True)
+        ouid = await fc_get_ouid(nickname)
+        params = {"ouid": ouid, "tradetype": tval, "offset": 0, "limit": 5}
+        try:
+            data = await fc_get("/fconline/v1/user/trade", params)
+        except ValueError as exc:
+            if "OPENAPI00004" in str(exc):
+                data = await fc_get("/fconline/v1/user/trade", {"ouid": ouid, "offset": 0, "limit": 5})
+            else:
+                raise
+        rows = data.get("trades") if isinstance(data, dict) else data
+        rows = rows or []
+        lines = []
+        for r in rows[:5]:
+            item = fc_pretty_player_by_id(r.get("spid")) if r.get("spid") else "-"
+            price = r.get("value") or "-"
+            trade_type = r.get("tradeType") or tval
+            date = r.get("tradeDate") or ""
+            grade = r.get("grade") or "-"
+            lines.append(f"{date} | {trade_type} | {item} | 강화:{grade} | 가격:{price}")
+        embed = discord.Embed(
+            title=f"{nickname} 거래 기록(최근 5, {tval})",
+            description="\n".join(lines) or "데이터 없음",
+            color=0x3498DB,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        msg = str(exc)
+        if "OPENAPI00004" in msg:
+            await interaction.followup.send("조회 실패: 닉네임을 확인하거나 거래 내역이 없는 경우일 수 있습니다. tradetype은 sell/buy만 지원하며, 없으면 자동 재시도합니다.", ephemeral=True)
+        else:
+            await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="fcmeta", description="FC 메타데이터 요약")
+@app_commands.describe(meta_type="matchtype/season/division 중 하나")
+async def slash_fcmeta(interaction: discord.Interaction, meta_type: str = "matchtype"):
+    await interaction.response.defer(ephemeral=True)
+    meta_type = meta_type.lower()
+    endpoint_map = {
+        "matchtype": "/static/fconline/meta/matchtype.json",
+        "season": "/static/fconline/meta/seasonid.json",
+        "division": "/static/fconline/meta/division.json",
+    }
+    endpoint = endpoint_map.get(meta_type)
+    if not endpoint:
+        return await interaction.followup.send("사용법: meta_type은 matchtype/season/division 중 하나", ephemeral=True)
+    try:
+        data = await fc_get(endpoint, {})
+        if isinstance(data, list):
+            items = data[:10]
+            if meta_type == "matchtype":
+                lines = [f"{d.get('matchtype')}: {d.get('desc')}" for d in items]
+            elif meta_type == "season":
+                lines = [f"{d.get('seasonId')}: {d.get('className')}" for d in items]
+            else:
+                lines = [f"{d.get('divisionId')}: {d.get('divisionName')}" for d in items]
+        else:
+            lines = ["데이터 없음"]
+        embed = discord.Embed(title=f"FC 메타 ({meta_type})", description="\n".join(lines) or "데이터 없음", color=0x3498DB)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="fcmatchdetail", description="FC 최근 경기 결과 요약")
+@app_commands.describe(nickname="닉네임", matchtype="매치타입 (기본 50)")
+async def slash_fcmatchdetail(interaction: discord.Interaction, nickname: str, matchtype: str = "50"):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ouid = await fc_get_ouid(nickname)
+        params = {"ouid": ouid, "offset": 0, "limit": 5, "matchtype": matchtype}
+        match_ids = await fc_get("/fconline/v1/user/match", params)
+        match_ids = match_ids if isinstance(match_ids, list) else []
+        lines = []
+        for mid in match_ids[:5]:
+            try:
+                detail = await fc_get("/fconline/v1/match-detail", {"matchid": mid})
+                infos = detail.get("matchInfo") or []
+                if len(infos) < 2:
+                    lines.append(f"{mid}: 상세 없음")
+                    continue
+                p1, p2 = infos[0], infos[1]
+                mine = p1 if p1.get("ouid") == ouid else p2
+                opp = p2 if mine is p1 else p1
+                my_score = mine.get("shoot", {}).get("goalTotal") if mine else "?"
+                opp_score = opp.get("shoot", {}).get("goalTotal") if opp else "?"
+                opp_name = opp.get("nickname") if opp else "?"
+                result = "무" if my_score == opp_score else ("승" if my_score > opp_score else "패")
+                lines.append(f"{result} {my_score}:{opp_score} vs {opp_name} (matchId {mid})")
+            except Exception as inner:
+                lines.append(f"{mid}: 상세 실패 ({inner})")
+        embed = discord.Embed(
+            title=f"{nickname} 최근 경기 요약",
+            description="\n".join(lines) or "데이터 없음",
+            color=0x3498DB,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
+@tree.command(name="fcplayer", description="FC 선수 이름으로 검색")
+@app_commands.describe(name="선수 이름")
+async def slash_fcplayer(interaction: discord.Interaction, name: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await ensure_fc_meta()
+        matches = find_players_by_name(name, limit=5)
+        if not matches:
+            return await interaction.followup.send("검색 결과가 없습니다.", ephemeral=True)
+        lines = [fc_pretty_player(p) for p in matches]
+        embed = discord.Embed(title=f"선수 검색: {name}", description="\n".join(lines), color=0x3498DB)
+        first_spid = matches[0].get("id")
+        if first_spid:
+            embed.set_thumbnail(url=fc_player_image(first_spid))
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
 
 
 @tree.error
