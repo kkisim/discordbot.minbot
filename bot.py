@@ -7,6 +7,7 @@ import random
 import logging
 from typing import Dict, List, Any
 from collections import deque
+from urllib.parse import quote
 
 import aiohttp
 import discord
@@ -30,8 +31,11 @@ VOLUME_DB = float(os.getenv("BOT_VOLUME_DB", "-22"))  # 기본 출력 게인(dB)
 STATE_FILE = os.getenv("BOT_STATE_FILE", "bot_state.json")
 CMD_COOLDOWN = float(os.getenv("CMD_COOLDOWN", "2.0"))  # 초 단위, 0이면 해제
 DELETE_COMMANDS = os.getenv("DELETE_COMMANDS", "true").lower() in ("1", "true", "yes", "on")
+QUIET_NOTICE = os.getenv("QUIET_NOTICE", "false").lower() in ("1", "true", "yes", "on")
 NEXON_API_KEY = os.getenv("NEXON_API_KEY")
 FIFA_API_KEY = os.getenv("FIFA_API_KEY")
+RIOT_API_KEY = os.getenv("RIOT_API_KEY")
+LOL_DEFAULT_REGION = os.getenv("LOL_DEFAULT_REGION", "kr").lower()
 
 # yt-dlp 설정 (고음질 우선, 검색 허용)
 ytdl_opts = {
@@ -282,6 +286,212 @@ def fc_pretty_player_by_id(spid: int) -> str:
     return fc_pretty_player(info)
 
 
+# -------- LoL (Riot API) helpers --------
+RIOT_ROUTE_BY_PLATFORM = {
+    "br1": "americas",
+    "la1": "americas",
+    "la2": "americas",
+    "na1": "americas",
+    "oc1": "americas",
+    "kr": "asia",
+    "jp1": "asia",
+    "ph2": "asia",
+    "sg2": "asia",
+    "th2": "asia",
+    "tw2": "asia",
+    "vn2": "asia",
+    "eun1": "europe",
+    "euw1": "europe",
+    "tr1": "europe",
+    "ru": "europe",
+}
+
+QUEUE_NAME = {
+    420: "랭크 솔로",
+    440: "랭크 자유",
+    430: "일반 (선택)",
+    400: "일반 (드래프트)",
+    450: "칼바람",
+    490: "빠른 대전",
+    700: "격전",
+}
+
+
+def resolve_riot_hosts(region: str | None) -> tuple[str, str]:
+    platform = (region or LOL_DEFAULT_REGION or "kr").lower()
+    routing = RIOT_ROUTE_BY_PLATFORM.get(platform, "asia")
+    return platform, routing
+
+
+async def riot_get(path: str, region: str | None, *, use_routing: bool, params: dict | None = None) -> dict:
+    if not RIOT_API_KEY:
+        raise ValueError("RIOT_API_KEY가 설정되지 않았습니다.")
+    platform, routing = resolve_riot_hosts(region)
+    host = routing if use_routing else platform
+    url = f"https://{host}.api.riotgames.com{path}"
+    headers = {"X-Riot-Token": RIOT_API_KEY}
+    async with aiohttp.ClientSession(headers=headers) as session:
+        async with session.get(url, params=params, timeout=10) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise ValueError(f"API 오류 {resp.status}: {text}")
+            return await resp.json()
+
+
+def kda_text(kills: int, deaths: int, assists: int) -> str:
+    if deaths == 0:
+        return "Perfect"
+    return f"{(kills + assists) / max(deaths, 1):.2f}"
+
+
+def format_match_line(match: dict) -> str:
+    win = match.get("win")
+    result = "승" if win else "패"
+    queue_name = match.get("queue_name") or str(match.get("queue_id", ""))
+    champ = match.get("champion", "챔피언")
+    k = match.get("kills", 0)
+    d = match.get("deaths", 0)
+    a = match.get("assists", 0)
+    kda = match.get("kda", "?")
+    duration = match.get("duration_text", "")
+    return f"{result} | {queue_name} | {champ} | {k}/{d}/{a} ({kda} KDA) | {duration}"
+
+
+def parse_match_detail(detail: dict, puuid: str) -> dict | None:
+    info = detail.get("info") or {}
+    meta = detail.get("metadata") or {}
+    participants = info.get("participants") or []
+    me = next((p for p in participants if p.get("puuid") == puuid), None)
+    if not me:
+        return None
+    queue_id = info.get("queueId")
+    duration_s = info.get("gameDuration") or 0
+    mins, secs = divmod(int(duration_s), 60)
+    duration_text = f"{mins}분 {secs:02d}초"
+    return {
+        "match_id": meta.get("matchId"),
+        "queue_id": queue_id,
+        "queue_name": QUEUE_NAME.get(queue_id, str(queue_id) if queue_id else "알 수 없음"),
+        "champion": me.get("championName") or "챔피언",
+        "kills": me.get("kills", 0),
+        "deaths": me.get("deaths", 0),
+        "assists": me.get("assists", 0),
+        "kda": kda_text(me.get("kills", 0), me.get("deaths", 0), me.get("assists", 0)),
+        "win": bool(me.get("win")),
+        "duration_text": duration_text,
+    }
+
+
+async def fetch_lol_recent(summoner_name: str, region: str | None = None) -> dict:
+    platform, routing = resolve_riot_hosts(region)
+    game_name = summoner_name
+    tag_line = None
+    if "#" in summoner_name:
+        game_name, tag_line = [part.strip() for part in summoner_name.split("#", 1)]
+
+    if tag_line:
+        # Riot ID 기반 조회 (전 지역 유니크)
+        acct = await riot_get(
+            f"/riot/account/v1/accounts/by-riot-id/{quote(game_name)}/{quote(tag_line)}",
+            routing,
+            use_routing=True,
+        )
+        puuid = acct.get("puuid")
+        if not puuid:
+            raise ValueError("소환사 정보를 찾지 못했습니다.")
+        summoner = await riot_get(f"/lol/summoner/v4/summoners/by-puuid/{puuid}", platform, use_routing=False)
+    else:
+        encoded = quote(summoner_name)
+        summoner = await riot_get(f"/lol/summoner/v4/summoners/by-name/{encoded}", platform, use_routing=False)
+        puuid = summoner.get("puuid")
+        if not puuid:
+            raise ValueError("소환사 정보를 찾지 못했습니다.")
+
+    summoner_id = summoner.get("id")
+    ranks = await riot_get(f"/lol/league/v4/entries/by-summoner/{summoner_id}", platform, use_routing=False)
+    rank_solo = next((r for r in (ranks or []) if r.get("queueType") == "RANKED_SOLO_5x5"), None)
+    rank_flex = next((r for r in (ranks or []) if r.get("queueType") == "RANKED_FLEX_SR"), None)
+
+    match_ids = await riot_get(f"/lol/match/v5/matches/by-puuid/{puuid}/ids", routing, use_routing=True, params={"start": 0, "count": 5})
+    summaries = []
+    for mid in (match_ids or [])[:5]:
+        try:
+            detail = await riot_get(f"/lol/match/v5/matches/{mid}", routing, use_routing=True)
+            parsed = parse_match_detail(detail, puuid)
+            if parsed:
+                summaries.append(parsed)
+        except Exception as exc:
+            summaries.append({"match_id": mid, "win": False, "queue_name": "조회 실패", "champion": str(exc), "kills": 0, "deaths": 0, "assists": 0, "kda": "?", "duration_text": "-"})
+
+    return {
+        "platform": platform,
+        "summoner": summoner,
+        "rank_solo": rank_solo,
+        "rank_flex": rank_flex,
+        "riot_id": {"name": game_name, "tag": tag_line} if tag_line else None,
+        "matches": summaries,
+    }
+
+
+def format_rank_line(entry: dict | None, label: str) -> str:
+    if not entry:
+        return f"{label}: 기록 없음"
+    tier = entry.get("tier", "-")
+    div = entry.get("rank", "")
+    lp = entry.get("leaguePoints", 0)
+    wins = entry.get("wins", 0)
+    losses = entry.get("losses", 0)
+    total = wins + losses
+    wr = f"{(wins/total)*100:.1f}%" if total else "-"
+    return f"{label}: {tier} {div} {lp}LP | {wins}승 {losses}패 ({wr})"
+
+
+def build_lol_embed(summary: dict) -> discord.Embed:
+    summoner = summary.get("summoner", {})
+    riot_id = summary.get("riot_id")
+    matches = summary.get("matches", [])
+    name = summoner.get("name") or (riot_id.get("name") if riot_id else "소환사")
+    tag = riot_id.get("tag") if riot_id else None
+    level = summoner.get("summonerLevel")
+    platform = summary.get("platform", LOL_DEFAULT_REGION)
+    rank_solo = summary.get("rank_solo")
+    rank_flex = summary.get("rank_flex")
+    if tag:
+        opgg_link = f"https://www.op.gg/summoners/{platform}/{quote(name)}-{quote(tag)}"
+        display_name = f"{name}#{tag}"
+    else:
+        opgg_link = f"https://www.op.gg/summoners/{platform}/{quote(name)}"
+        display_name = name
+
+    # 최근 경기 요약 통계
+    win_cnt = sum(1 for m in matches if m.get("win"))
+    lose_cnt = sum(1 for m in matches if m.get("win") is False)
+    k_sum = sum(m.get("kills", 0) for m in matches)
+    d_sum = sum(m.get("deaths", 0) for m in matches)
+    a_sum = sum(m.get("assists", 0) for m in matches)
+    games = len(matches)
+    if games:
+        avg_kda = "Perfect" if d_sum == 0 else f"{(k_sum + a_sum) / max(d_sum, 1):.2f}"
+        recent_summary = f"{games}경기 {win_cnt}승 {lose_cnt}패 | K/D/A {k_sum}/{d_sum}/{a_sum} | 평균 KDA {avg_kda}"
+    else:
+        recent_summary = "최근 경기 기록 없음"
+
+    embed = discord.Embed(
+        title=f"{display_name} 전적 요약 ({platform.upper()})",
+        description=f"소환사 레벨: {level}\n[OP.GG 바로가기]({opgg_link})",
+        color=0x5865F2,
+    )
+    embed.add_field(name="최근 5경기 요약", value=recent_summary, inline=False)
+    embed.add_field(name="랭크", value=f"{format_rank_line(rank_solo, '솔로 랭크')}\n{format_rank_line(rank_flex, '자유 랭크')}", inline=False)
+
+    if matches:
+        lines = [f"{idx+1}) {format_match_line(m)}" for idx, m in enumerate(matches[:5])]
+        embed.add_field(name="최근 5경기", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="최근 5경기", value="경기 기록을 찾지 못했습니다.", inline=False)
+    return embed
+
+
 def save_state():
     data = {
         "queues": {},
@@ -348,7 +558,15 @@ async def on_ready():
         except Exception:
             pass
         synced = True
+    # 패널 상태 주기적 검사 시작
+    bot.loop.create_task(panel_watcher())
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
+
+@bot.before_invoke
+async def delete_prefix_command_message(ctx):
+    """모든 프리픽스 명령 호출 메시지를 설정에 따라 삭제."""
+    bot.loop.create_task(maybe_delete_command(ctx.message))
 
 
 @bot.command()
@@ -915,6 +1133,42 @@ async def fc_meta(ctx, meta_type: str = "matchtype"):
         await ctx.send(f"조회 실패: {exc}")
 
 
+# LoL recent matches (Riot API)
+@bot.command(name="lol", aliases=["전적", "롤전적"])
+async def lol_recent(ctx, *, summoner_name: str):
+    """롤 소환사 최근 5경기 요약을 조회합니다."""
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    if not RIOT_API_KEY:
+        return await ctx.send("RIOT_API_KEY가 설정되지 않았습니다.")
+    try:
+        summary = await fetch_lol_recent(summoner_name, LOL_DEFAULT_REGION)
+        embed = build_lol_embed(summary)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
+@bot.command(name="수민")
+async def su_min(ctx):
+    """고정된 소환사 '신 수 민#kr1' 전적을 바로 보여줍니다."""
+    bot.loop.create_task(maybe_delete_command(ctx.message))
+    cd_err = check_cooldown(ctx.author.id)
+    if cd_err:
+        return await ctx.send(cd_err)
+    if not RIOT_API_KEY:
+        return await ctx.send("RIOT_API_KEY가 설정되지 않았습니다.")
+    target = "신 수 민#kr1"
+    try:
+        summary = await fetch_lol_recent(target, LOL_DEFAULT_REGION)
+        embed = build_lol_embed(summary)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"조회 실패: {exc}")
+
+
 async def extract_stream(url: str):
     loop = asyncio.get_event_loop()
     try:
@@ -1164,30 +1418,50 @@ class SearchView(discord.ui.View):
 
 async def update_panel(guild: discord.Guild, channel: discord.abc.Messageable | None = None):
     """패널 메시지를 해당 길드에 대해 갱신."""
+    queue = get_queue(guild.id)
+    track = current_track.get(guild.id)
+    voice = guild.voice_client
+    msg = panels.get(guild.id)
+
+    # 대기열/재생 없음 상태면 패널 메시지를 제거
+    if not queue and not track and (voice is None or not voice.is_playing()):
+        if msg:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            panels.pop(guild.id, None)
+        return
+
     embed = build_panel_embed(guild)
     view = PlayerView()
-    msg = panels.get(guild.id)
 
     # 새 패널 채널이 지정되지 않았고, 기존 패널도 없으면 현재 트랙의 채널을 사용
     if channel is None and msg is None:
-        track = current_track.get(guild.id)
         if track:
             channel = track.get("channel")
 
-    # 기존 패널이 있으면 갱신 시도
-    if msg:
-        try:
-            await msg.edit(embed=embed, view=view)
-            return
-        except Exception:
-            panels.pop(guild.id, None)
-    # 새로 생성
+    # 채널이 주어졌다면 기존 패널을 지우고 새 메시지를 만들어 하단에 유지
     if channel:
+        old = panels.pop(guild.id, None)
+        if old:
+            try:
+                await old.delete()
+            except Exception:
+                pass
         try:
             new_msg = await channel.send(embed=embed, view=view)
             panels[guild.id] = new_msg
+            return
         except Exception:
             pass
+
+    # 채널이 없고 기존 패널만 있을 때는 편집으로만 갱신
+    if msg and not channel:
+        try:
+            await msg.edit(embed=embed, view=view)
+        except Exception:
+            panels.pop(guild.id, None)
 
 
 async def start_playback(guild: discord.Guild, voice: discord.VoiceClient):
@@ -1275,6 +1549,7 @@ async def handle_after(guild: discord.Guild, error: Exception | None):
 
 @bot.command()
 async def join(ctx):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
     if ctx.author.voice is None:
         return await ctx.send("먼저 음성 채널에 들어가 주세요.")
     await ctx.author.voice.channel.connect()
@@ -1283,6 +1558,7 @@ async def join(ctx):
 
 @bot.command()
 async def leave(ctx):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
     role_err = check_role_ctx(ctx)
     if role_err:
         return await ctx.send(role_err)
@@ -1301,6 +1577,7 @@ async def leave(ctx):
 @bot.command(aliases=["p"])
 async def play(ctx, *, url: str):
     try:
+        bot.loop.create_task(maybe_delete_command(ctx.message))
         cd_err = check_cooldown(ctx.author.id)
         if cd_err:
             return await ctx.send(cd_err)
@@ -1342,6 +1619,7 @@ async def play(ctx, *, url: str):
 
 @bot.command()
 async def stop(ctx):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
     role_err = check_role_ctx(ctx)
     if role_err:
         return await ctx.send(role_err)
@@ -1359,6 +1637,7 @@ async def stop(ctx):
 
 @bot.command()
 async def pause(ctx):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
     role_err = check_role_ctx(ctx)
     if role_err:
         return await ctx.send(role_err)
@@ -1376,6 +1655,7 @@ async def pause(ctx):
 
 @bot.command()
 async def resume(ctx):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
     role_err = check_role_ctx(ctx)
     if role_err:
         return await ctx.send(role_err)
@@ -1391,6 +1671,7 @@ async def resume(ctx):
 
 @bot.command()
 async def skip(ctx):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
     role_err = check_role_ctx(ctx)
     if role_err:
         return await ctx.send(role_err)
@@ -1406,6 +1687,7 @@ async def skip(ctx):
 
 @bot.command(name="queue")
 async def queue_list(ctx):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
     role_err = check_role_ctx(ctx)
     if role_err:
         return await ctx.send(role_err)
@@ -1421,6 +1703,7 @@ async def queue_list(ctx):
 
 @bot.command(name="clear")
 async def queue_clear(ctx):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
     role_err = check_role_ctx(ctx)
     if role_err:
         return await ctx.send(role_err)
@@ -1436,6 +1719,7 @@ async def queue_clear(ctx):
 
 @bot.command(name="panel")
 async def panel_cmd(ctx):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
     role_err = check_role_ctx(ctx)
     if role_err:
         return await ctx.send(role_err)
@@ -1449,6 +1733,7 @@ async def panel_cmd(ctx):
 @bot.command(name="move")
 async def queue_move(ctx, src: int, dst: int):
     """대기열에서 src번째 트랙을 dst 위치로 이동 (1-based index)."""
+    bot.loop.create_task(maybe_delete_command(ctx.message))
     role_err = check_role_ctx(ctx)
     if role_err:
         return await ctx.send(role_err)
@@ -1473,6 +1758,7 @@ async def queue_move(ctx, src: int, dst: int):
 @bot.command(name="remove")
 async def queue_remove(ctx, index: int):
     """대기열에서 index번째 트랙을 제거 (1-based index)."""
+    bot.loop.create_task(maybe_delete_command(ctx.message))
     role_err = check_role_ctx(ctx)
     if role_err:
         return await ctx.send(role_err)
@@ -1494,6 +1780,7 @@ async def queue_remove(ctx, index: int):
 
 @bot.command(name="search")
 async def search_cmd(ctx, *, query: str):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
     role_err = check_role_ctx(ctx)
     if role_err:
         return await ctx.send(role_err)
@@ -1515,6 +1802,7 @@ async def search_cmd(ctx, *, query: str):
 
 @bot.command(name="choose")
 async def choose_cmd(ctx, index: int):
+    bot.loop.create_task(maybe_delete_command(ctx.message))
     results = search_cache.get(ctx.guild.id)
     if not results:
         return await ctx.send("먼저 !search 로 검색해 주세요.")
@@ -2319,6 +2607,20 @@ async def slash_fcplayer(interaction: discord.Interaction, name: str):
         await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
 
 
+@tree.command(name="lol", description="롤 소환사 최근 5경기 요약을 보여줍니다.")
+@app_commands.describe(summoner_name="소환사명", region="플랫폼(region) 코드, 미입력 시 기본값(LOL_DEFAULT_REGION)")
+async def slash_lol(interaction: discord.Interaction, summoner_name: str, region: str | None = None):
+    await interaction.response.defer(ephemeral=True)
+    if not RIOT_API_KEY:
+        return await interaction.followup.send("RIOT_API_KEY가 설정되지 않았습니다.", ephemeral=True)
+    try:
+        summary = await fetch_lol_recent(summoner_name, region or LOL_DEFAULT_REGION)
+        embed = build_lol_embed(summary)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"조회 실패: {exc}", ephemeral=True)
+
+
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     try:
@@ -2328,6 +2630,18 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             await interaction.response.send_message(f"오류가 발생했어요: {error}", ephemeral=True)
     except Exception:
         pass
+
+
+async def panel_watcher():
+    """주기적으로 패널 상태를 점검해 재생/큐가 없을 때 자동 제거."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        for guild in bot.guilds:
+            try:
+                await update_panel(guild)
+            except Exception:
+                pass
+        await asyncio.sleep(10)
 
 
 if __name__ == "__main__":
